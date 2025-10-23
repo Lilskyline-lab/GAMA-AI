@@ -255,7 +255,7 @@ Exemples d'utilisation:
         """
     )
     
-    parser.add_argument("--dataset", type=str, default="./train.txt",
+    parser.add_argument("--dataset", type=str, default="./train5k.txt",
                         help="Dataset d'entraînement (fichier texte)")
     parser.add_argument("--save", default="./tokenizer_model.bin", type=valid_tokenizer_model,
                         help="Chemin de sauvegarde du tokenizer")
@@ -326,4 +326,5 @@ Exemples d'utilisation:
             print(f"📝 Texte direct: {len(input_data)} caractères\n")
         
         tokens = tokenizer.encoder(input_data, verbose=True)
+
         print(f"\n🎯 Résultat: {len(tokens)} tokens générés")
