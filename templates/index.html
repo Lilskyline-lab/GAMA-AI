@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interface HessGpt</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Voici HessGpt</h1>
+            <button class="settings-btn" onclick="toggleSettings()">⚙️ Paramètres</button>
+        </div>
+
+        <div class="settings-panel" id="settingsPanel">
+            <div class="settings-content">
+                <h3>Paramètres de génération</h3>
+                
+                <div class="setting-item">
+                    <label for="maxTokens">Tokens max: <span id="maxTokensValue">40</span></label>
+                    <input type="range" id="maxTokens" min="10" max="200" value="40" oninput="updateValue('maxTokens')">
+                </div>
+
+                <div class="setting-item">
+                    <label for="temperature">Température: <span id="temperatureValue">0.7</span></label>
+                    <input type="range" id="temperature" min="0.1" max="2.0" step="0.1" value="0.7" oninput="updateValue('temperature')">
+                </div>
+
+                <div class="setting-item">
+                    <label for="topK">Top-K: <span id="topKValue">50</span></label>
+                    <input type="range" id="topK" min="1" max="100" value="50" oninput="updateValue('topK')">
+                </div>
+
+                <div class="setting-item">
+                    <label for="topP">Top-P: <span id="topPValue">0.95</span></label>
+                    <input type="range" id="topP" min="0.1" max="1.0" step="0.05" value="0.95" oninput="updateValue('topP')">
+                </div>
+
+                <div class="setting-item">
+                    <label for="repetitionPenalty">Pénalité répétition: <span id="repetitionPenaltyValue">1.1</span></label>
+                    <input type="range" id="repetitionPenalty" min="1.0" max="2.0" step="0.1" value="1.1" oninput="updateValue('repetitionPenalty')">
+                </div>
+
+                <div class="model-info" id="modelInfo">
+                    <h4>Configuration du modèle</h4>
+                    <p>Chargement...</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="chat-container">
+            <div class="chat-messages" id="chatMessages">
+                <div class="message bot-message">
+                    <div class="message-content">
+                        <strong>Bot:</strong> Bonjour! Je suis votre assistant HessGpt. Comment puis-je ne pas vous aider?
+                    </div>
+                </div>
+            </div>
+
+            <div class="chat-input-container">
+                <input 
+                    type="text" 
+                    id="userInput" 
+                    placeholder="Tapez votre message ici..." 
+                    onkeypress="handleKeyPress(event)"
+                >
+                <button onclick="sendMessage()" id="sendBtn">Envoyer</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
