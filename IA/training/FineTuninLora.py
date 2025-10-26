@@ -1,9 +1,8 @@
 """
-Système d'entraînement avec Instruction Tuning intégré
+Système d'entraînement avec LoRA (Low-Rank Adaptation) + Instruction Tuning
 Sources : Wikipedia (connaissances catégorisées) + OASST1 (conversation) + Fichiers personnalisés
-Utilise le système d'instruction tuning pour formater automatiquement les données
+Utilise LoRA pour un fine-tuning efficace avec peu de paramètres
 """
-#FineTUning
 
 import os
 import sys
@@ -17,6 +16,7 @@ import random
 from collections import Counter
 
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.nn import CrossEntropyLoss
 from torch.optim import AdamW
@@ -39,6 +39,182 @@ except ImportError:
     print("⚠️ 'datasets' non installé. Installez avec: pip install datasets")
     HF_AVAILABLE = False
 
+
+# ============================================================================
+# IMPLÉMENTATION LoRA
+# ============================================================================
+
+class LoRALayer(nn.Module):
+    """
+    Couche LoRA pour adapter une couche linéaire existante
+    W_new = W_frozen + (B @ A) * scaling
+    """
+    def __init__(self, in_features, out_features, rank=8, alpha=16, dropout=0.1):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+        
+        # Matrices LoRA de faible rang
+        self.lora_A = nn.Parameter(torch.randn(in_features, rank) * 0.01)
+        self.lora_B = nn.Parameter(torch.zeros(rank, out_features))
+        
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        
+    def forward(self, x, original_output):
+        """
+        x: entrée originale
+        original_output: sortie de la couche linéaire gelée
+        """
+        # Calcul de l'adaptation LoRA
+        lora_output = self.dropout(x) @ self.lora_A @ self.lora_B
+        return original_output + lora_output * self.scaling
+
+
+class LoRAWrapper(nn.Module):
+    """
+    Wrapper pour appliquer LoRA à un modèle GPT2
+    """
+    def __init__(self, base_model, rank=8, alpha=16, dropout=0.1, target_modules=None):
+        super().__init__()
+        self.base_model = base_model
+        self.rank = rank
+        self.alpha = alpha
+        self.dropout = dropout
+        
+        # Par défaut, on applique LoRA aux projections Q, K, V et FFN
+        if target_modules is None:
+            target_modules = ['q_proj', 'k_proj', 'v_proj', 'fc1', 'fc2']
+        self.target_modules = target_modules
+        
+        # Geler tous les paramètres du modèle de base
+        for param in self.base_model.parameters():
+            param.requires_grad = False
+        
+        # Ajouter les couches LoRA
+        self.lora_layers = nn.ModuleDict()
+        self.name_mapping = {}  # Correspondance nom_original -> nom_safe
+        self._inject_lora()
+        
+        print(f"\n🔧 LoRA Configuration:")
+        print(f"   - Rank: {rank}")
+        print(f"   - Alpha: {alpha}")
+        print(f"   - Dropout: {dropout}")
+        print(f"   - Target modules: {target_modules}")
+        print(f"   - LoRA layers added: {len(self.lora_layers)}")
+        print(f"   - Trainable params: {self.count_trainable_params():,}")
+        print(f"   - Total params: {self.count_total_params():,}")
+        print(f"   - Trainable %: {100 * self.count_trainable_params() / self.count_total_params():.2f}%")
+    
+    def _inject_lora(self):
+        """Injecte les couches LoRA dans le modèle"""
+        for name, module in self.base_model.named_modules():
+            # Chercher les couches linéaires qui correspondent aux modules cibles
+            if isinstance(module, nn.Linear):
+                # Vérifier si le nom contient un des modules cibles
+                for target in self.target_modules:
+                    if target in name:
+                        lora_layer = LoRALayer(
+                            module.in_features,
+                            module.out_features,
+                            rank=self.rank,
+                            alpha=self.alpha,
+                            dropout=self.dropout
+                        )
+                        # Remplacer les points par des underscores pour ModuleDict
+                        safe_name = name.replace('.', '_')
+                        self.lora_layers[safe_name] = lora_layer
+                        self.name_mapping[name] = safe_name
+                        break
+    
+    def forward(self, input_ids, attention_mask=None):
+        """Forward pass avec LoRA"""
+        # Hook pour intercepter et modifier les sorties
+        handles = []
+        
+        def make_hook(lora_layer):
+            def hook(module, input, output):
+                # Appliquer LoRA à la sortie
+                return lora_layer(input[0], output)
+            return hook
+        
+        # Créer un dictionnaire des modules une seule fois
+        modules_dict = dict(self.base_model.named_modules())
+        
+        # Attacher les hooks aux modules concernés
+        for orig_name, safe_name in self.name_mapping.items():
+            lora_layer = self.lora_layers[safe_name]
+            module = modules_dict[orig_name]
+            handle = module.register_forward_hook(make_hook(lora_layer))
+            handles.append(handle)
+        
+        # Forward pass du modèle de base
+        logits, hidden_states = self.base_model(input_ids)
+        
+        # Retirer les hooks
+        for handle in handles:
+            handle.remove()
+        
+        return logits, hidden_states
+    
+    def count_trainable_params(self):
+        """Compte le nombre de paramètres entraînables (LoRA uniquement)"""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    
+    def count_total_params(self):
+        """Compte le nombre total de paramètres"""
+        return sum(p.numel() for p in self.parameters())
+    
+    def save_lora_weights(self, path):
+        """Sauvegarde uniquement les poids LoRA"""
+        lora_state = {
+            'lora_layers': self.lora_layers.state_dict(),
+            'config': {
+                'rank': self.rank,
+                'alpha': self.alpha,
+                'dropout': self.dropout,
+                'target_modules': self.target_modules
+            }
+        }
+        torch.save(lora_state, path)
+        print(f"✅ Poids LoRA sauvegardés: {path}")
+    
+    def load_lora_weights(self, path):
+        """Charge les poids LoRA"""
+        lora_state = torch.load(path, map_location=next(self.parameters()).device)
+        self.lora_layers.load_state_dict(lora_state['lora_layers'])
+        print(f"✅ Poids LoRA chargés: {path}")
+    
+    def merge_and_save_full_model(self, path):
+        """Fusionne LoRA avec le modèle de base et sauvegarde le tout"""
+        # Dégeler temporairement les paramètres
+        for param in self.base_model.parameters():
+            param.requires_grad = True
+        
+        # Créer un dictionnaire des modules
+        modules_dict = dict(self.base_model.named_modules())
+        
+        # Fusionner LoRA dans les poids du modèle de base
+        for orig_name, safe_name in self.name_mapping.items():
+            lora_layer = self.lora_layers[safe_name]
+            module = modules_dict[orig_name]
+            if isinstance(module, nn.Linear):
+                # W_new = W_old + (B @ A) * scaling
+                delta_w = (lora_layer.lora_A @ lora_layer.lora_B) * lora_layer.scaling
+                module.weight.data += delta_w.T
+        
+        # Sauvegarder le modèle fusionné
+        torch.save(self.base_model.state_dict(), path)
+        print(f"✅ Modèle fusionné sauvegardé: {path}")
+        
+        # Regeler les paramètres
+        for param in self.base_model.parameters():
+            param.requires_grad = False
+
+
+# ============================================================================
+# CLASSES EXISTANTES (WikipediaScraper, OASST1DialogueLoader, etc.)
+# ============================================================================
 
 class WikipediaScraper:
     def __init__(self, language='fr'):
@@ -168,7 +344,7 @@ class OASST1DialogueLoader:
     
     def get_next_batch(self, count=None) -> List[Dict]:
         if self.dataset is None:
-            return self._get_fallback_dialogues(count or self.batch_size)
+            return []
         
         if count is None:
             count = self.batch_size
@@ -204,39 +380,11 @@ class OASST1DialogueLoader:
         self.current_index = end_index
         
         if not dialogues:
-            print("⚠️ Aucune conversation extraite, utilisation du fallback")
-            return self._get_fallback_dialogues(count)
+            print("⚠️ Aucune conversation extraite")
+        else:
+            print(f"✅ {len(dialogues)} conversations extraites")
         
-        print(f"✅ {len(dialogues)} conversations extraites")
         return dialogues
-    
-    def _get_fallback_dialogues(self, count) -> List[Dict]:
-        print("⚠️ Utilisation des dialogues de fallback")
-        
-        fallback = [
-            ("Hello", "Hello! How can I help you today?"),
-            ("Hi", "Hi there! What can I do for you?"),
-            ("How are you?", "I'm doing well, thank you for asking! How are you?"),
-            ("What's your name?", "I'm an AI assistant here to help you."),
-            ("Tell me a joke", "Why don't scientists trust atoms? Because they make up everything!"),
-            ("Help me", "Of course! What do you need help with?"),
-            ("Thank you", "You're welcome! Happy to help!"),
-            ("Goodbye", "Goodbye! Have a great day!"),
-        ]
-        
-        if self.language == 'fr':
-            fallback = [
-                ("Bonjour", "Bonjour ! Comment puis-je vous aider aujourd'hui ?"),
-                ("Salut", "Salut ! Que puis-je faire pour toi ?"),
-                ("Comment vas-tu ?", "Je vais bien, merci ! Et toi ?"),
-                ("Quel est ton nom ?", "Je suis un assistant IA ici pour t'aider."),
-                ("Raconte une blague", "Pourquoi les plongeurs plongent-ils en arrière ? Parce que sinon ils tombent dans le bateau !"),
-                ("Aide-moi", "Bien sûr ! De quoi as-tu besoin ?"),
-                ("Merci", "De rien ! Ravi d'avoir pu aider !"),
-                ("Au revoir", "Au revoir ! Passe une excellente journée !"),
-            ]
-        
-        return [{"human": h, "assistant": a} for h, a in fallback[:count]]
     
     def get_stats(self) -> Dict:
         return {
@@ -314,9 +462,7 @@ class WikiQAGenerator:
 
 
 class InstructionTunedDataset(Dataset):
-    """
-    Dataset qui applique automatiquement l'instruction tuning
-    """
+    """Dataset qui applique automatiquement l'instruction tuning"""
     def __init__(self, pairs, tokenizer, max_length=512, instruction_template="chat_bot"):
         self.pairs = pairs
         self.tokenizer = tokenizer
@@ -372,7 +518,11 @@ def collate_fn(batch, pad_id=0):
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
-class ContinuousTrainer:
+# ============================================================================
+# TRAINER AVEC LoRA
+# ============================================================================
+
+class LoRATrainer:
     def __init__(
         self,
         model_dir,
@@ -380,7 +530,11 @@ class ContinuousTrainer:
         device,
         language='fr',
         instruction_template="chat_bot",
-        custom_data_dir=None
+        custom_data_dir=None,
+        lora_rank=8,
+        lora_alpha=16,
+        lora_dropout=0.1,
+        target_modules=None
     ):
         self.model_dir = model_dir
         self.tokenizer_path = tokenizer_path
@@ -392,23 +546,31 @@ class ContinuousTrainer:
             'data'
         )
         
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
+        self.target_modules = target_modules
+        
         self.wiki_scraper = WikipediaScraper(language)
         self.wiki_qa_gen = WikiQAGenerator()
         self.dialogue_loader = OASST1DialogueLoader(language, batch_size=50)
         
         os.makedirs(model_dir, exist_ok=True)
         
-        self.model, self.tokenizer, self.config = self._load_or_init_model()
+        self.base_model, self.tokenizer, self.config = self._load_base_model()
+        self.model = self._wrap_with_lora()
         
-        self.history_file = os.path.join(model_dir, "training_history.json")
+        self.history_file = os.path.join(model_dir, "lora_training_history.json")
         self.history = self._load_history()
         
         self.topics_file = os.path.join(model_dir, "trained_topics.json")
         self.topics = self._load_topics()
         
-        print(f"\n✅ Instruction Tuning activé (template: {instruction_template})")
+        print(f"\n✅ LoRA + Instruction Tuning activé")
+        print(f"   Template: {instruction_template}")
+        print(f"   LoRA Rank: {lora_rank}, Alpha: {lora_alpha}")
 
-    def _load_or_init_model(self):
+    def _load_base_model(self):
         cfg_path = os.path.join(self.model_dir, "config.json")
         model_path = os.path.join(self.model_dir, "model.pt")
         
@@ -438,17 +600,35 @@ class ContinuousTrainer:
         )
         
         if os.path.exists(model_path):
-            print(f"✅ Chargement du modèle existant : {model_path}")
+            print(f"✅ Chargement du modèle de base : {model_path}")
             try:
                 state = torch.load(model_path, map_location=self.device, weights_only=True)
             except TypeError:
                 state = torch.load(model_path, map_location=self.device)
             model.load_state_dict(state)
         else:
-            print("🆕 Initialisation d'un nouveau modèle")
+            print("🆕 Initialisation d'un nouveau modèle de base")
         
         model.to(self.device)
         return model, tokenizer, cfg
+    
+    def _wrap_with_lora(self):
+        """Enveloppe le modèle de base avec LoRA"""
+        lora_model = LoRAWrapper(
+            self.base_model,
+            rank=self.lora_rank,
+            alpha=self.lora_alpha,
+            dropout=self.lora_dropout,
+            target_modules=self.target_modules
+        )
+        
+        # Charger les poids LoRA existants si disponibles
+        lora_path = os.path.join(self.model_dir, "lora_weights.pt")
+        if os.path.exists(lora_path):
+            print(f"✅ Chargement des poids LoRA existants")
+            lora_model.load_lora_weights(lora_path)
+        
+        return lora_model
 
     def _load_history(self):
         if os.path.exists(self.history_file):
@@ -467,7 +647,12 @@ class ContinuousTrainer:
             "total_wiki_qa": 0,
             "total_dialogue_qa": 0,
             "categories_trained": {},
-            "instruction_template_used": self.instruction_template
+            "instruction_template_used": self.instruction_template,
+            "lora_config": {
+                "rank": self.lora_rank,
+                "alpha": self.lora_alpha,
+                "dropout": self.lora_dropout
+            }
         }
 
     def _save_history(self):
@@ -501,9 +686,7 @@ class ContinuousTrainer:
             json.dump(self.topics, f, indent=2, ensure_ascii=False)
 
     def load_custom_data(self) -> List[Dict]:
-        """
-        Charge les données personnalisées depuis le dossier data/
-        """
+        """Charge les données personnalisées depuis le dossier data/"""
         custom_data = []
         
         if not os.path.exists(self.custom_data_dir):
@@ -544,7 +727,7 @@ class ContinuousTrainer:
         use_custom_data=True
     ):
         print("\n" + "="*60)
-        print("🔄 GÉNÉRATION DATASET MIXTE AVEC INSTRUCTION TUNING")
+        print("🔄 GÉNÉRATION DATASET MIXTE AVEC INSTRUCTION TUNING + LoRA")
         print("="*60)
         
         dataset = []
@@ -553,6 +736,7 @@ class ContinuousTrainer:
         categories_count = {}
         
         # SOURCE 1: Données personnalisées
+        custom_data = []
         if use_custom_data:
             custom_data = self.load_custom_data()
             if custom_data:
@@ -623,10 +807,11 @@ class ContinuousTrainer:
         
         print(f"\n" + "="*60)
         print(f"✅ DATASET TOTAL: {len(dataset)} exemples")
-        print(f"   - Données personnalisées: {len(custom_data) * repeat_important if use_custom_data and custom_data else 0}")
+        print(f"   - Données personnalisées: {len(custom_data) * repeat_important if custom_data else 0}")
         print(f"   - Wikipedia Q&A: {wiki_count}")
         print(f"   - OASST1 dialogues: {dialogue_count * repeat_important}")
         print(f"🎯 Instruction Template: {self.instruction_template}")
+        print(f"🔧 LoRA: rank={self.lora_rank}, alpha={self.lora_alpha}")
         print("="*60)
         
         self._save_topics()
@@ -640,11 +825,12 @@ class ContinuousTrainer:
         num_dialogues=50,
         epochs=3,
         batch_size=8,
-        lr=5e-5,
-        use_custom_data=True
+        lr=5e-4,
+        use_custom_data=True,
+        save_merged=False
     ):
         print("\n" + "="*70)
-        print("🚀 DÉMARRAGE CYCLE D'ENTRAÎNEMENT AVEC INSTRUCTION TUNING")
+        print("🚀 DÉMARRAGE CYCLE D'ENTRAÎNEMENT LoRA + INSTRUCTION TUNING")
         print("="*70)
         
         dataset_pairs = self.generate_dataset(
@@ -669,7 +855,11 @@ class ContinuousTrainer:
             collate_fn=lambda b: collate_fn(b, pad_id=0)
         )
         
-        optimizer = AdamW(self.model.parameters(), lr=lr)
+        # Optimiser uniquement les paramètres LoRA
+        optimizer = AdamW(
+            [p for p in self.model.parameters() if p.requires_grad],
+            lr=lr
+        )
         loss_fn = CrossEntropyLoss(ignore_index=-100)
         
         self.model.train()
@@ -678,6 +868,7 @@ class ContinuousTrainer:
         step = 0
         
         print(f"\n⏳ Entraînement sur {len(dataset)} exemples, {epochs} époques")
+        print(f"📊 Paramètres entraînables: {self.model.count_trainable_params():,}")
         
         for epoch in range(epochs):
             epoch_loss = 0
@@ -688,7 +879,7 @@ class ContinuousTrainer:
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
                 
-                logits, _ = self.model(input_ids)
+                logits, _ = self.model(input_ids, attention_mask)
                 
                 loss = loss_fn(
                     logits.view(-1, self.config["vocab_size"]),
@@ -710,8 +901,14 @@ class ContinuousTrainer:
         
         avg_loss = total_loss / step
         
-        torch.save(self.model.state_dict(), os.path.join(self.model_dir, "model.pt"))
-        print(f"\n✅ Modèle sauvegardé: {self.model_dir}/model.pt")
+        # Sauvegarder les poids LoRA
+        lora_path = os.path.join(self.model_dir, "lora_weights.pt")
+        self.model.save_lora_weights(lora_path)
+        
+        # Optionnellement fusionner et sauvegarder le modèle complet
+        if save_merged:
+            merged_path = os.path.join(self.model_dir, "model_merged.pt")
+            self.model.merge_and_save_full_model(merged_path)
         
         cycle_info = {
             "cycle": len(self.history["cycles"]) + 1,
@@ -719,7 +916,12 @@ class ContinuousTrainer:
             "examples": len(dataset),
             "epochs": epochs,
             "avg_loss": avg_loss,
-            "instruction_template": self.instruction_template
+            "instruction_template": self.instruction_template,
+            "lora_config": {
+                "rank": self.lora_rank,
+                "alpha": self.lora_alpha,
+                "trainable_params": self.model.count_trainable_params()
+            }
         }
         self.history["cycles"].append(cycle_info)
         self.history["total_qa_trained"] += len(dataset)
@@ -728,17 +930,30 @@ class ContinuousTrainer:
         print("\n" + "="*70)
         print(f"✅ CYCLE {cycle_info['cycle']} TERMINÉ")
         print(f"   Loss moyenne: {avg_loss:.4f}")
+        print(f"   Paramètres LoRA entraînés: {self.model.count_trainable_params():,}")
         print(f"   Total exemples entraînés (historique): {self.history['total_qa_trained']}")
         print("="*70)
 
     def display_stats(self):
         print("\n" + "="*60)
-        print("📊 STATISTIQUES D'ENTRAÎNEMENT")
+        print("📊 STATISTIQUES D'ENTRAÎNEMENT LoRA")
         print("="*60)
         
         print(f"\n🔢 Cycles d'entraînement: {len(self.history['cycles'])}")
         print(f"📝 Total exemples entraînés: {self.history['total_qa_trained']}")
         print(f"🎯 Template d'instruction: {self.instruction_template}")
+        
+        if 'lora_config' in self.history:
+            lora_cfg = self.history['lora_config']
+            print(f"\n🔧 Configuration LoRA:")
+            print(f"   - Rank: {lora_cfg.get('rank', 'N/A')}")
+            print(f"   - Alpha: {lora_cfg.get('alpha', 'N/A')}")
+            print(f"   - Dropout: {lora_cfg.get('dropout', 'N/A')}")
+        
+        print(f"\n💾 Efficacité mémoire:")
+        print(f"   - Paramètres entraînables: {self.model.count_trainable_params():,}")
+        print(f"   - Paramètres totaux: {self.model.count_total_params():,}")
+        print(f"   - Ratio: {100 * self.model.count_trainable_params() / self.model.count_total_params():.2f}%")
         
         if self.history['cycles']:
             last_cycle = self.history['cycles'][-1]
@@ -746,6 +961,8 @@ class ContinuousTrainer:
             print(f"   - Date: {last_cycle['timestamp']}")
             print(f"   - Exemples: {last_cycle['examples']}")
             print(f"   - Loss: {last_cycle['avg_loss']:.4f}")
+            if 'lora_config' in last_cycle:
+                print(f"   - Paramètres LoRA: {last_cycle['lora_config'].get('trainable_params', 'N/A'):,}")
         
         print(f"\n📚 Sujets Wikipedia traités: {len(self.topics['wikipedia_topics'])}")
         
@@ -766,11 +983,51 @@ class ContinuousTrainer:
             print(f"\n📦 Progression OASST1: {stats.get('progress', 'N/A')}")
         
         print("="*60)
+    
+    def export_for_inference(self, output_dir):
+        """Exporte le modèle pour l'inférence (modèle de base + poids LoRA)"""
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Copier le modèle de base
+        base_model_path = os.path.join(self.model_dir, "model.pt")
+        if os.path.exists(base_model_path):
+            import shutil
+            shutil.copy(base_model_path, os.path.join(output_dir, "base_model.pt"))
+        
+        # Copier les poids LoRA
+        lora_path = os.path.join(self.model_dir, "lora_weights.pt")
+        if os.path.exists(lora_path):
+            import shutil
+            shutil.copy(lora_path, os.path.join(output_dir, "lora_weights.pt"))
+        
+        # Copier la config
+        config_path = os.path.join(self.model_dir, "config.json")
+        if os.path.exists(config_path):
+            import shutil
+            shutil.copy(config_path, os.path.join(output_dir, "config.json"))
+        
+        # Sauvegarder les infos LoRA
+        lora_info = {
+            "rank": self.lora_rank,
+            "alpha": self.lora_alpha,
+            "dropout": self.lora_dropout,
+            "target_modules": self.target_modules,
+            "instruction_template": self.instruction_template
+        }
+        with open(os.path.join(output_dir, "lora_config.json"), 'w') as f:
+            json.dump(lora_info, f, indent=2)
+        
+        print(f"\n✅ Modèle exporté vers: {output_dir}")
+        print("   Fichiers:")
+        print("   - base_model.pt (modèle de base gelé)")
+        print("   - lora_weights.pt (adaptations LoRA)")
+        print("   - config.json (configuration du modèle)")
+        print("   - lora_config.json (configuration LoRA)")
 
 
 def main():
     print("\n" + "="*70)
-    print("🤖 SYSTÈME D'ENTRAÎNEMENT LLM AVEC INSTRUCTION TUNING")
+    print("🤖 SYSTÈME D'ENTRAÎNEMENT LLM AVEC LoRA + INSTRUCTION TUNING")
     print("="*70)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -779,7 +1036,7 @@ def main():
     model_dir = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "saved_models",
-        "my_llm"
+        "my_llm_lora"
     )
     tokenizer_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -797,38 +1054,70 @@ def main():
     print(f"📁 Model directory: {model_dir}")
     print(f"🔤 Tokenizer: {tokenizer_path}")
     
-    trainer = ContinuousTrainer(
+    # Configuration LoRA
+    print("\n🔧 Configuration LoRA:")
+    print("   - Rank: 8 (faible rang pour efficacité)")
+    print("   - Alpha: 16 (facteur de scaling)")
+    print("   - Dropout: 0.1 (régularisation)")
+    print("   - Modules ciblés: Q, K, V projections + FFN")
+    
+    trainer = LoRATrainer(
         model_dir=model_dir,
         tokenizer_path=tokenizer_path,
         device=device,
         language='en',
-        instruction_template="chat_bot"
+        instruction_template="chat_bot",
+        lora_rank=8,
+        lora_alpha=16,
+        lora_dropout=0.1,
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'fc1', 'fc2']
     )
     
     trainer.display_stats()
     
-    print("\n🎯 Démarrage de l'entraînement...")
+    print("\n🎯 Démarrage de l'entraînement LoRA...")
     print("   - 10 articles Wikipedia (English)")
     print("   - 100 dialogues OASST1 (English)")
     print("   - 3 époques")
-    print("   - Vocab: 5,000 tokens")
+    print("   - Batch size: 4")
+    print("   - Learning rate: 5e-4 (plus élevé pour LoRA)")
     print("   - Template: chat_bot (Human/Bot)")
-    
-    trainer.train_one_cycle(
-        num_articles=10,
-        qa_per_article=3,
-        num_dialogues=100,
-        epochs=3,
-        batch_size=4,
-        lr=5e-5,
-        use_custom_data=False
-    )
-    
+
+
+    for cycle in range(100):  # 100 cycles
+        print(f"\n{'='*70}")
+        print(f"🔄 CYCLE {cycle + 1}/100")
+        print(f"{'='*70}")
+        trainer.train_one_cycle(
+            num_articles=20,
+            qa_per_article=5,
+            num_dialogues=200,
+            epochs=3,
+            batch_size=4,
+            lr=5e-4,
+            use_custom_data=False,
+            save_merged=False
+        )
+       # Sauvegarder périodiquement le modèle fusionné
+    if (cycle + 1) % 10 == 0:
+        trainer.model.merge_and_save_full_model(
+            os.path.join(trainer.model_dir, f"model_checkpoint_cycle_{cycle+1}.pt")
+        )
     trainer.display_stats()
     
-    print("\n✅ Entraînement terminé!")
-    print("💡 Les données sont automatiquement formatées avec instruction tuning")
-    print("📊 Sources: Wikipedia + OASST1 (Hugging Face)")
+    # Exporter pour l'inférence
+    export_dir = os.path.join(model_dir, "export")
+    trainer.export_for_inference(export_dir)
+    
+    print("\n✅ Entraînement LoRA terminé!")
+    print("\n💡 Avantages de LoRA:")
+    print("   ✓ Entraîne seulement ~1% des paramètres")
+    print("   ✓ Beaucoup moins de mémoire requise")
+    print("   ✓ Entraînement plus rapide")
+    print("   ✓ Modèle de base reste intact")
+    print("   ✓ Plusieurs adaptations LoRA possibles sur le même modèle")
+    print("\n📊 Sources: Wikipedia + OASST1 (Hugging Face)")
+    print("🎯 Format: Instruction Tuning automatique")
 
 
 if __name__ == "__main__":
